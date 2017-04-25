@@ -25,3 +25,7 @@
 FROM nginx
 RUN rm /etc/nginx/conf.d/default.conf
 ADD invenio.conf /etc/nginx/conf.d/
+RUN chmod -R 777 /var/log/nginx /var/cache/nginx/ /var/run/ \
+    && chmod -R 644 /etc/nginx/*
+RUN ln -sf /dev/stdout /var/log/nginx/access.log
+RUN ln -sf /dev/stderr /var/log/nginx/error.log

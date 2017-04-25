@@ -25,5 +25,6 @@
 # Use Elasticsearch 2.
 FROM elasticsearch:2
 COPY scripts/provision-elasticsearch.sh /tmp/
+RUN chmod -R 777 /usr/share/elasticsearch/config
 # Install Elasticsarch plugins:
 RUN /tmp/provision-elasticsearch.sh
