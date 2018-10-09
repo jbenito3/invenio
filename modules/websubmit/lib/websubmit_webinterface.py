@@ -1,19 +1,19 @@
-# This file is part of Invenio.
-# Copyright (C) 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014 CERN.
-#
-# Invenio is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License as
-# published by the Free Software Foundation; either version 2 of the
-# License, or (at your option) any later version.
-#
-# Invenio is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-# General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Invenio; if not, write to the Free Software Foundation, Inc.,
-# 59 Temple Place, Suite 330, Boston, MA 02111-1307, USA.
+## This file is part of Invenio.
+## Copyright (C) 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014 CERN.
+##
+## Invenio is free software; you can redistribute it and/or
+## modify it under the terms of the GNU General Public License as
+## published by the Free Software Foundation; either version 2 of the
+## License, or (at your option) any later version.
+##
+## Invenio is distributed in the hope that it will be useful, but
+## WITHOUT ANY WARRANTY; without even the implied warranty of
+## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+## General Public License for more details.
+##
+## You should have received a copy of the GNU General Public License
+## along with Invenio; if not, write to the Free Software Foundation, Inc.,
+## 59 Temple Place, Suite 330, Boston, MA 02111-1307, USA.
 
 __lastupdated__ = """$Date$"""
 
@@ -27,7 +27,10 @@ import sys
 import shutil
 
 from urllib import urlencode
-from collections import defaultdict
+try:
+    from collections import defaultdict
+except:
+    from invenio.containerutils import defaultdict
 
 from invenio.bibrecord import create_record
 from invenio.config import \
@@ -38,6 +41,7 @@ from invenio.config import \
      CFG_SITE_SECURE_URL, \
      CFG_WEBSUBMIT_STORAGEDIR, \
      CFG_PREFIX, \
+     CFG_SITE_SUPPORT_EMAIL, \
      CFG_CERN_SITE
 from invenio.crossrefutils import get_marcxml_for_doi, CrossrefError
 from invenio import webinterface_handler_config as apache
@@ -55,7 +59,10 @@ from invenio.bibdocfile import stream_file, \
     decompose_file, propose_next_docname
 from invenio.errorlib import register_exception
 from invenio.htmlutils import is_html_text_editor_installed
-from invenio.websubmit_icon_creator import create_icon, InvenioWebSubmitIconCreatorError
+from invenio.websubmit_icon_creator import create_icon, \
+                                           create_crop, \
+                                           InvenioWebSubmitIconCreatorError
+
 from invenio.ckeditor_invenio_connector import process_CKEditor_upload, send_response
 import invenio.template
 websubmit_templates = invenio.template.load('websubmit')
@@ -72,11 +79,216 @@ from invenio.websubmit_engine import home, \
                                      makeCataloguesTable, \
                                      get_authors_from_allowed_sources
 
+from invenio.websubmit_functions.Move_Photos_to_Storage import create_a_record
+# For user suggestions
+from invenio.mailutils import scheduled_send_email
+from invenio.websubmit_config import CFG_WEBSUBMIT_COPY_MAILS_TO_ADMIN
+CFG_EMAIL_FROM_ADDRESS = '%s Submission Engine <%s>' % (CFG_SITE_NAME, CFG_SITE_SUPPORT_EMAIL)
+# Where the user suggestion should be sent
+SUGGESTION_EMAIL_ADDRESS = "photo-archive@cern.ch"
+
 class WebInterfaceSubmitPages(WebInterfaceDirectory):
 
     _exports = ['summary', 'sub', 'direct', '', 'attachfile', 'uploadfile',
                 'getuploadedfile', 'upload_video', ('continue', 'continue_'),
-                'doilookup', 'get_authors']
+                'crop_image', 'get_authors', 'suggestion_form', 'doilookup']
+
+    def suggestion_form(self, req, form):
+        """Suggestion form handler."""
+
+        def error_handler(status, message):
+            """Return a standar error message.
+
+            :param str status: HTTP status code
+            :param str message: A human readable message
+            :return: A response message
+            :rtype: `json` object
+            """
+            build_response = {
+                'status': status,
+                'error': 'true',
+                'message': message
+            }
+            req.set_status(status)
+            return json.dumps(build_response)
+
+        argd = wash_urlargd(form, {
+            'field': (str, ''),
+            'record_id': (str, ''),
+            'description': (str, ''),
+            'language': (str, 'en')
+        })
+
+        user_info = collect_user_info(req)
+
+        req.content_type = 'application/json'
+        req.headers_out.add('Access-Control-Allow-Origin', '*')
+
+        if not user_info.get('uid', ''):
+            return error_handler('401', 'Unauthorized request. You must be logged in with a CERN account.')
+
+        if not argd.get('description') or not argd.get('record_id'):
+            return error_handler('400', 'Description is required.')
+        # Prepare description
+        description = argd.get('description').rstrip().strip()
+        req.send_http_header()
+        # if language is fr
+        if argd.get('language') == 'fr':
+            record_data = [
+                ('590', '', '', '', [('b', description), ('9', str(user_info.get('email'))), ('w', str(user_info.get('external_login')))]),
+            ]
+        else:
+            record_data = [
+                ('520', '', '', '', [('b', description), ('9', str(user_info.get('email'))), ('w', str(user_info.get('external_login')))]),
+            ]
+        create_a_record(record_data, argd.get('record_id'), file_name="user_suggestion")
+
+        response = {
+            'description': description,
+            'language': argd.get('language'),
+        }
+
+        # lets add the email task
+        email_txt = ("Dear admins,\n\n the user {0} has been submited:\n\n '{1}' in {2} language. \n\n For the record"
+                     " <http://{3}/record/{4}>").format(user_info.get('email'),
+                                                        argd.get('description'),
+                                                        argd.get('language'),
+                                                        CFG_SITE_URL,
+                                                        argd.get('record_id'))
+
+        scheduled_send_email(CFG_EMAIL_FROM_ADDRESS, SUGGESTION_EMAIL_ADDRESS, \
+                   "A user suggestion for [%s] has been submitted" % argd.get('record_id'), \
+                   email_txt, copy_to_admin=CFG_WEBSUBMIT_COPY_MAILS_TO_ADMIN)
+
+        return json.dumps(response)
+
+    def crop_image(self, req, form):
+        """
+        Creates the cropped image API
+        =============================
+        """
+        # First of all wash the urls
+        argd = wash_urlargd(form, {
+            'doctype': (str, ''),
+            'access': (str, ''),
+            'indir': (str, ''),
+            'session_id': (str, ''),
+            'action': (str, ''),
+            'key': (str, 'file'),
+            'filename': (str, None),
+            'width': (str, None),
+            'height': (str, None),
+            'pos_x': (str, None),
+            'pos_y': (str, None)
+        })
+        # Wash the user id from request
+        uid = getUid(req)
+        # Init a dictionary that holds the file directories
+        # aka files, icons, crop etc.
+        directories = {}
+        # Common prefix for current directory
+        common_dir_prefix = os.path.join(CFG_WEBSUBMIT_STORAGEDIR,
+                                         argd['indir'],
+                                         argd['doctype'],
+                                         argd['access'])
+        # Common suffix for current directory
+        common_dir_suffix = os.path.join(str(uid), argd['key'])
+        # Asbolute path for icons directory
+        directories['icons'] = os.path.join(common_dir_prefix,
+                                            'icons',
+                                            common_dir_suffix)
+        # Asbolute path for files directory
+        directories['files'] = os.path.join(common_dir_prefix,
+                                            'files',
+                                            common_dir_suffix)
+        # Asbolute path for crop directory
+        directories['crop'] = os.path.join(common_dir_prefix,
+                                           'crop',
+                                           common_dir_suffix)
+
+        # Check if crop folder exists
+        if not os.path.exists(directories['crop']):
+            try:
+                os.makedirs(directories['crop'])
+            except OSError, e:
+                if e.errno != errno.EEXIST:
+                    register_exception(req=req, alert_admin=True)
+                    raise apache.SERVER_RETURN(apache.HTTP_FORBIDDEN)
+
+        def create_the_cropped_file():
+            """
+            It creates the cropped file
+            """
+            (path, name) = create_crop(os.path.join(directories['files'],
+                                                    argd['filename']),
+                                       argd['width'].strip(),
+                                       argd['height'].strip(),
+                                       argd['pos_x'].strip(),
+                                       argd['pos_y'].strip())
+            return (path, name)
+
+        def create_the_ready_to_crop_version():
+            """
+            It creates a 1440 version of the original image
+            """
+            # Finally make the cropped version
+            (path, name) = create_icon({
+                'input-file': os.path.join(directories['files'], argd['filename']),
+                'icon-name': "resized-%s" % argd['filename'],
+                'icon-file-format': 'gif',
+                'multipage-icon': False,
+                'multipage-icon-delay': 100,
+                'icon-scale': "1440>",
+                'verbosity': 0,
+            })
+            return (path, name)
+
+        def make_security_checks():
+            """
+            It checks if the user has permission to submit
+            """
+            return True
+
+        # Ok let's first check if the user could submit
+        if not make_security_checks():
+            # Raise 401
+            raise apache.SERVER_RETURN(apache.HTTP_UNAUTHORIZED)
+        else:
+            # else is clean lets continue
+            # which action?
+            if argd['action'] == 'create_ready_to_crop':
+                # Check if the required field `filename` and `absPath` are there
+                # If not raise 400
+                if argd['filename'] is None:
+                    raise apache.SERVER_RETURN(apache.HTTP_BAD_REQUEST)
+
+                # Make the cropped version
+                (resized_path, resized_name) = create_the_ready_to_crop_version()
+                # Move the cropped file to submission directory
+                # Move the crop-icon to submit dir
+                os.rename(os.path.join(resized_path, resized_name),
+                          os.path.join(directories['icons'], resized_name))
+                # return the absPath of the file
+                return resized_name
+
+            elif argd['action'] == 'create_the_cropped_version':
+
+                if any(argd.get(key) in (None, '') for key in ('filename', 'width',
+                                                    'height', 'pos_x', 'pos_y')):
+                    raise apache.SERVER_RETURN(apache.HTTP_BAD_REQUEST)
+
+                # Do the crop
+                (cropped_path, cropped_name) = create_the_cropped_file()
+                # Move the cropped file to submission directory
+                # Move the crop-icon to submit dir
+                os.rename(os.path.join(cropped_path, cropped_name),
+                          os.path.join(directories['crop'], cropped_name))
+                # return the absPath of the file
+                return cropped_name
+
+            else:
+                # Raise 406
+                raise apache.SERVER_RETURN(apache.HTTP_NOT_ACCEPTABLE)
 
     def uploadfile(self, req, form):
         """
@@ -101,6 +313,7 @@ class WebInterfaceSubmitPages(WebInterfaceDirectory):
             'indir': (str, ''),
             'session_id': (str, ''),
             'rename': (str, ''),
+            'replace': (str, ''),
             })
 
         curdir = None
@@ -115,29 +328,32 @@ class WebInterfaceSubmitPages(WebInterfaceDirectory):
                                   argd['access'])
 
         user_info = collect_user_info(req)
-        if form.has_key("session_id"):
+        uid = user_info['uid']
+        #if form.has_key("session_id"):
             # Are we uploading using Flash, which does not transmit
             # cookie? The expect to receive session_id as a form
             # parameter.  First check that IP addresses do not
             # mismatch. A ValueError will be raises if there is
             # something wrong
-            session = get_session(req=req, sid=argd['session_id'])
-            try:
-                session = get_session(req=req, sid=argd['session_id'])
-            except ValueError, e:
-                raise apache.SERVER_RETURN(apache.HTTP_BAD_REQUEST)
+        #    session = get_session(req=req, sid=argd['session_id'])
+        #    try:
+        #        session = get_session(req=req, sid=argd['session_id'])
+        #    except ValueError, e:
+        #        raise apache.SERVER_RETURN(apache.HTTP_BAD_REQUEST)
 
             # Retrieve user information. We cannot rely on the session here.
-            res = run_sql("SELECT uid FROM session WHERE session_key=%s", (argd['session_id'],))
-            if len(res):
-                uid = res[0][0]
-                user_info = collect_user_info(uid)
-                try:
-                    act_fd = file(os.path.join(curdir, 'act'))
-                    action = act_fd.read()
-                    act_fd.close()
-                except:
-                    action = ""
+        #    res = run_sql("SELECT uid FROM session WHERE session_key=%s", (argd['session_id'],))
+        #    if len(res):
+        #        uid = res[0][0]
+        #        user_info = collect_user_info(uid)
+
+
+        try:
+            act_fd = file(os.path.join(curdir, 'act'))
+            action = act_fd.read()
+            act_fd.close()
+        except:
+            action = ""
 
         try:
             recid_fd = file(os.path.join(curdir, 'SN'))
@@ -202,11 +418,12 @@ class WebInterfaceSubmitPages(WebInterfaceDirectory):
                     if filename != "":
                         # Check that file does not already exist
                         n = 1
-                        while os.path.exists(os.path.join(dir_to_open, filename)):
-                            #dirname, basename, extension = decompose_file(new_destination_path)
-                            basedir, name, extension = decompose_file(filename)
-                            new_name = propose_next_docname(name)
-                            filename = new_name + extension
+                        if not argd.get('replace'):
+                            while os.path.exists(os.path.join(dir_to_open, filename)):
+                                #dirname, basename, extension = decompose_file(new_destination_path)
+                                basedir, name, extension = decompose_file(filename)
+                                new_name = propose_next_docname(name)
+                                filename = new_name + extension
                         # This may be dangerous if the file size is bigger than the available memory
                         fp = open(os.path.join(dir_to_open, filename), "w")
                         fp.write(formfields.file.read())
@@ -246,8 +463,14 @@ class WebInterfaceSubmitPages(WebInterfaceDirectory):
                                         raise apache.SERVER_RETURN(apache.HTTP_FORBIDDEN)
                             os.rename(os.path.join(icon_path, icon_name),
                                       os.path.join(icons_dir, icon_name))
-                            added_files[key] = {'name': filename,
-                                                'iconName': icon_name}
+
+
+                            # It returns the names and the full path of the image
+                            added_files[key] = {
+                                        'name'     : filename,
+                                        'iconName' : icon_name,
+                                        'absPath'  : os.path.join(dir_to_open, filename)
+                                    }
                         except InvenioWebSubmitIconCreatorError, e:
                             # We could not create the icon
                             added_files[key] = {'name': filename}
@@ -503,39 +726,48 @@ class WebInterfaceSubmitPages(WebInterfaceDirectory):
         ./curdir/icons/uid directory, so that we are sure we stream
         files only to the user who uploaded them.
         """
-        argd = wash_urlargd(form, {'indir': (str, None),
-                                   'doctype': (str, None),
-                                   'access': (str, None),
-                                   'icon': (int, 0),
-                                   'key': (str, None),
-                                   'filename': (str, None),
-                                   'nowait': (int, 0)})
+        argd = wash_urlargd(form, {   'indir':   (str, None),
+                                    'doctype':   (str, None),
+                                     'access':   (str, None),
+                                       'icon':   (int, 0),
+                                       'type':   (str, ''),
+                                        'key':   (str, None),
+                                   'filename':   (str, None),
+                                   'onlysize':   (str, ''),
+                                     'nowait':   (int, 0),
+                                   'filepath':   (str, '')
+                                  })
 
         if None in argd.values():
             raise apache.SERVER_RETURN(apache.HTTP_BAD_REQUEST)
 
         uid = getUid(req)
 
-        if argd['icon']:
+        # support legacy `icon`
+        if argd['icon'] or argd['type'] == 'icon':
+            response_type = 'icons'
+        else:
+            response_type = argd['type'] if argd['type'] not in (None, '') else 'files'
+        if not argd['filepath']:
             file_path = os.path.join(CFG_WEBSUBMIT_STORAGEDIR,
                                      argd['indir'],
                                      argd['doctype'],
                                      argd['access'],
-                                     'icons',
+                                     response_type,
                                      str(uid),
                                      argd['key'],
                                      argd['filename']
                                      )
         else:
-            file_path = os.path.join(CFG_WEBSUBMIT_STORAGEDIR,
-                                     argd['indir'],
-                                     argd['doctype'],
-                                     argd['access'],
-                                     'files',
-                                     str(uid),
-                                     argd['key'],
-                                     argd['filename']
-                                     )
+            file_path = argd['filepath']
+
+        if argd['onlysize'] != '':
+            from invenio.get_image_size import get_image_size
+            (x, y) = get_image_size(file_path)
+            return json.dumps({
+                               'x':x,
+                               'y':y
+                             })
 
         abs_file_path = os.path.abspath(file_path)
         if abs_file_path.startswith(CFG_WEBSUBMIT_STORAGEDIR):
@@ -833,6 +1065,7 @@ class WebInterfaceSubmitPages(WebInterfaceDirectory):
         url = "%s/submit/direct?%s" % (CFG_SITE_SECURE_URL, urlencode(params, doseq=True))
         redirect_to_url(req, url)
 
+
     def summary(self, req, form):
         args = wash_urlargd(form, {
             'doctype': (str, ''),
@@ -902,7 +1135,7 @@ class WebInterfaceSubmitPages(WebInterfaceDirectory):
             else:
                 record = create_record(marcxml_template)[0]
                 if record:
-                    # We need to convert this record structure to a simple dictionary
+                    # We need to convert this ugly monster received from create_record to a nice dictionary
                     for key, value in record.items():  # key, value = (773, [([('0', 'PER:64142'), ...], ' ', ' ', '', 47)])
                         for val in value:  # val = ([('0', 'PER:64142'), ...], ' ', ' ', '', 47)
                             ind1 = val[1].replace(" ", "_")
@@ -1022,29 +1255,29 @@ class WebInterfaceSubmitPages(WebInterfaceDirectory):
 
         return json.dumps(result)
 
-# def retrieve_most_recent_attached_file(file_path):
-#     """
-#     Retrieve the latest file that has been uploaded with the
-#     CKEditor. This is the only way to retrieve files that the
-#     CKEditor has renamed after the upload.
+## def retrieve_most_recent_attached_file(file_path):
+##     """
+##     Retrieve the latest file that has been uploaded with the
+##     CKEditor. This is the only way to retrieve files that the
+##     CKEditor has renamed after the upload.
 
-#     Eg: 'prefix/image.jpg' was uploaded but did already
-#     exist. CKEditor silently renamed it to 'prefix/image(1).jpg':
-#     >>> retrieve_most_recent_attached_file('prefix/image.jpg')
-#     'prefix/image(1).jpg'
-#     """
-#     (base_path, filename) = os.path.split(file_path)
-#     base_name = os.path.splitext(filename)[0]
-#     file_ext = os.path.splitext(filename)[1][1:]
-#     most_recent_filename = filename
-#     i = 0
-#     while True:
-#         i += 1
-#         possible_filename = "%s(%d).%s" % \
-#                             (base_name, i, file_ext)
-#         if os.path.exists(base_path + os.sep + possible_filename):
-#             most_recent_filename = possible_filename
-#         else:
-#             break
+##     Eg: 'prefix/image.jpg' was uploaded but did already
+##     exist. CKEditor silently renamed it to 'prefix/image(1).jpg':
+##     >>> retrieve_most_recent_attached_file('prefix/image.jpg')
+##     'prefix/image(1).jpg'
+##     """
+##     (base_path, filename) = os.path.split(file_path)
+##     base_name = os.path.splitext(filename)[0]
+##     file_ext = os.path.splitext(filename)[1][1:]
+##     most_recent_filename = filename
+##     i = 0
+##     while True:
+##         i += 1
+##         possible_filename = "%s(%d).%s" % \
+##                             (base_name, i, file_ext)
+##         if os.path.exists(base_path + os.sep + possible_filename):
+##             most_recent_filename = possible_filename
+##         else:
+##             break
 
-#     return os.path.join(base_path, most_recent_filename)
+##     return os.path.join(base_path, most_recent_filename)
